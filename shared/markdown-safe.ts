@@ -39,8 +39,10 @@ export function isSafeUrl(href: string, protocols: readonly string[]): boolean {
 }
 
 type HtmlToken = { text: string };
-// marked 14 の tokenizer は link / image の `title` と image の `text`(alt)を HTML エスケープ済みで渡す。
-// `href` はエスケープされていない。ここで再エスケープすると "&amp;amp;" のように二重になる(Codex の指摘)。
+// link / image の `title` と image の `text`(alt)は、marked 14 ではエスケープ済み、marked 18 では生の文字で渡ってくる。
+// どちらでも同じ結果になるよう、文字参照をいったん文字に戻してから一度だけエスケープする(attr)。
+// そのまま出すと、marked 18 では title の " で属性が壊れる。二重にエスケープすると "&amp;amp;" になる(Codex の指摘)。
+// `href` はエスケープされていない。
 // `href` に書かれた文字参照("?a=1&amp;b=2" の &amp;)は、いったん文字に戻してから検査・エスケープする。
 // 戻せない名前(HTML5 だけの &colon; など)は & のままエスケープされ、ブラウザでも文字のまま。
 // "javascript&colon;" が javascript: に化けることはない(& は常に &amp; になる)。
@@ -51,6 +53,11 @@ type ImageToken = { href: string; title?: string | null; text: string };
  * marked v13+ の token 形式の renderer。
  * `this.parser` を使うので、必ず marked.use({ renderer: SAFE_RENDERER }) の形で渡す。
  */
+/** 属性値・地の文に出す文字。エスケープ済みでも生でも、一度だけエスケープした形にそろえる */
+function attr(s: string): string {
+  return escapeHtml(decodeEntities(s));
+}
+
 export const SAFE_RENDERER = {
   /** 生の HTML(ブロック・インライン)は文字として出す */
   html(token: HtmlToken): string {
@@ -60,14 +67,14 @@ export const SAFE_RENDERER = {
     const text = this.parser.parseInline(token.tokens);
     const href = sanitizeUrl(decodeEntities(token.href), SAFE_LINK_PROTOCOLS);
     if (href === null) return text;
-    const title = token.title ? ` title="${token.title}"` : ""; // エスケープ済み
+    const title = token.title ? ` title="${attr(token.title)}"` : "";
     return `<a href="${escapeHtml(href)}"${title}>${text}</a>`;
   },
   image(token: ImageToken): string {
     const href = sanitizeUrl(decodeEntities(token.href), SAFE_IMAGE_PROTOCOLS);
-    if (href === null) return token.text; // エスケープ済み
-    const title = token.title ? ` title="${token.title}"` : ""; // エスケープ済み
-    return `<img src="${escapeHtml(href)}" alt="${token.text}"${title}>`;
+    if (href === null) return attr(token.text);
+    const title = token.title ? ` title="${attr(token.title)}"` : "";
+    return `<img src="${escapeHtml(href)}" alt="${attr(token.text)}"${title}>`;
   },
 };
 
