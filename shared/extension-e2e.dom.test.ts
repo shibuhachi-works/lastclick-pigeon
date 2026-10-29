@@ -94,11 +94,20 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
     const editor: Page = await editorPromise.catch(async (e) => {
       throw new Error(`note のタブが開きませんでした。ポップアップの表示: ${await popup.locator("#status").textContent()} (${(e as Error).message})`);
     });
+    const logs: string[] = [];
+    editor.on("console", (m) => logs.push(`${m.type()}: ${m.text()}`));
+    editor.on("pageerror", (e) => logs.push(`pageerror: ${e.message}`));
     await editor.waitForURL(/note\.com/, { timeout: 15_000 });
 
-    // 本文の確認待ちのバナー(✅)が出るまで待つ
+    // 本文の確認待ちのバナー(✅)が出るまで待つ。出なければ、原因を追えるようにバナーの中身とコンソールを出す
     const banner = editor.locator("#lastclick-pigeon-banner");
-    await banner.getByText("タイトル・本文・見出し画像を入れました").waitFor({ timeout: 30_000 });
+    await banner
+      .getByText("タイトル・本文・見出し画像を入れました")
+      .waitFor({ timeout: 30_000 })
+      .catch(async (e) => {
+        const text = await editor.evaluate(() => document.getElementById("lastclick-pigeon-banner")?.shadowRoot?.textContent ?? "(バナーなし)");
+        throw new Error(`バナーが出ませんでした。URL: ${editor.url()} / バナー: ${text.replace(/\s+/g, " ").trim()} / コンソール: ${logs.join(" | ") || "(なし)"} (${(e as Error).message.split("\n")[0]})`);
+      });
 
     assert.equal(await editor.locator("#title").inputValue(), "起動テストの記事");
     const body = await editor.locator("#body").innerHTML();
