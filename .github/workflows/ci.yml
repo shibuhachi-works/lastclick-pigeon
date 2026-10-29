@@ -13,15 +13,20 @@ jobs:
     name: shared / Playwright 版(テスト・型チェック)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            extension/package-lock.json
       - run: npm ci
       # shared/*.dom.test.ts が実ブラウザを使う
       - run: npx playwright install --with-deps chromium
+      # shared/extension-e2e.dom.test.ts がビルドした拡張(extension/dist)を Chromium に読み込む
+      - run: npm ci && npm run build
+        working-directory: extension
       - run: npm run typecheck
       - run: npm test
 
@@ -32,8 +37,8 @@ jobs:
       run:
         working-directory: extension
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

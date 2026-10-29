@@ -24,7 +24,8 @@ export type LoadedSelectors = {
  */
 export async function loadSelectors(): Promise<LoadedSelectors> {
   const stored = await chrome.storage.local.get([STORAGE.selectorsUrl, STORAGE.selectorsCache, STORAGE.githubToken]);
-  const url: string = stored[STORAGE.selectorsUrl] || DEFAULT_SELECTORS_URL;
+  // @types/chrome 0.3 から、読んだ値は unknown 扱いになったので型を明示する
+  const url: string = (stored[STORAGE.selectorsUrl] as string | undefined) || DEFAULT_SELECTORS_URL;
   const cache = stored[STORAGE.selectorsCache] as { url: string; fetchedAt: number; data: Selectors } | undefined;
 
   if (cache && cache.url === url && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {

@@ -67,6 +67,22 @@ describe("SAFE_RENDERER", () => {
   });
 });
 
+describe("SAFE_RENDERER(marked の版によらない)", () => {
+  // marked 14 は alt / title をエスケープ済みで、marked 18 は生の文字で渡す。どちらでも一度だけエスケープした形になる
+  const image = SAFE_RENDERER.image.bind(SAFE_RENDERER);
+  it("生の文字の alt / title の \" や & は、エスケープしてから属性に出す(属性を壊さない)", () => {
+    const out = image({ href: "https://example.com/a.png", text: 'A & B "x"', title: 'T "q" & x' });
+    assert.equal(out, '<img src="https://example.com/a.png" alt="A &amp; B &quot;x&quot;" title="T &quot;q&quot; &amp; x">');
+  });
+  it("エスケープ済みの alt / title は、二重にエスケープしない", () => {
+    const out = image({ href: "https://example.com/a.png", text: "A &amp; B &quot;x&quot;", title: "T &quot;q&quot; &amp; x" });
+    assert.equal(out, '<img src="https://example.com/a.png" alt="A &amp; B &quot;x&quot;" title="T &quot;q&quot; &amp; x">');
+  });
+  it("URL が通らない画像は、alt を文字として出す(タグにしない)", () => {
+    assert.equal(image({ href: "javascript:alert(1)", text: '<img src=x onerror="alert(1)">' }), "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+  });
+});
+
 describe("isSafeUrl", () => {
   it("相対パスは許可、// 始まりは不許可", () => {
     assert.equal(isSafeUrl("./a.png", ["http:", "https:"]), true);

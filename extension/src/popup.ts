@@ -89,8 +89,8 @@ function setStatus(msg: string, isError = false) {
 
 // 設定の読み書き
 chrome.storage.local.get([STORAGE.selectorsUrl, STORAGE.githubToken, STORAGE.advancedMode, STORAGE.skipBodyReview]).then((s) => {
-  $<HTMLInputElement>("selectors-url").value = s[STORAGE.selectorsUrl] ?? "";
-  $<HTMLInputElement>("github-token").value = s[STORAGE.githubToken] ?? "";
+  $<HTMLInputElement>("selectors-url").value = (s[STORAGE.selectorsUrl] as string | undefined) ?? "";
+  $<HTMLInputElement>("github-token").value = (s[STORAGE.githubToken] as string | undefined) ?? "";
   applyAdvanced(Boolean(s[STORAGE.advancedMode]));
   skipReviewEl.checked = Boolean(s[STORAGE.skipBodyReview]);
 });
