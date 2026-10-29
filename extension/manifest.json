@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Lastclick Pigeon for note",
+  "version": "0.1.1",
+  "description": "Markdown のファイルを選ぶだけで note の下書き(タイトル・本文・見出し画像・ハッシュタグ・マガジン)を組み立てます。公開ボタンは押しません。",
+  "homepage_url": "https://shibuhachi.works/lastclick-pigeon/",
+  "minimum_chrome_version": "120",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Lastclick Pigeon for note",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "permissions": [
+    "storage",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "https://note.com/*",
+    "https://editor.note.com/*",
+    "https://raw.githubusercontent.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://note.com/*",
+        "https://editor.note.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

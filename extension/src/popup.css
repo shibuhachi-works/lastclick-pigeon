@@ -1,0 +1,47 @@
+:root { font: 13px/1.5 system-ui, sans-serif; color: #222; }
+body { width: 420px; margin: 0; padding: 12px 14px 14px; box-sizing: border-box; }
+h1 { font-size: 15px; margin: 0; }
+.head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+button.small { padding: 3px 8px; font-size: 12px; }
+body.window { width: auto; max-width: 560px; margin: 0 auto; }
+body.window #open-window { display: none; }
+label { display: block; font-weight: 600; margin-top: 8px; }
+label input { font-weight: 400; }
+label.check { display: flex; align-items: center; gap: 6px; }
+label.check input { width: auto; margin: 0; }
+label.hint-check { font-weight: 400; font-size: 12px; color: #444; }
+input, textarea, button { font: inherit; box-sizing: border-box; }
+input[type="text"], input[type="url"], input[type="password"], textarea {
+  width: 100%; padding: 6px 8px; border: 1px solid #c8c8c8; border-radius: 6px; margin-top: 3px;
+}
+textarea { min-height: 170px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+.row { display: flex; gap: 6px; margin-top: 6px; }
+.row input { flex: 1; }
+input[type="file"][hidden] { display: none; }
+.hint-inline { font-weight: 400; color: #666; }
+/* ホバーで説明(title)が出るもの。点線の下線で「説明がある」ことだけ示す */
+.tip { cursor: help; }
+.tip:not(label) { text-decoration: underline dotted #999; text-underline-offset: 3px; }
+#version { user-select: none; cursor: default; }
+.dropzone { border: 2px dashed #8fd6c9; border-radius: 10px; padding: 14px 12px 12px; text-align: center; background: #f3fbf9; margin-top: 4px; transition: background .15s, border-color .15s; }
+body.dropping .dropzone { border-color: #35b3a0; background: #dff4ee; }
+.dz-icon { display: block; width: 30px; height: 30px; margin: 0 auto 4px; color: #35b3a0; }
+.dz-title { margin: 0; font-weight: 700; font-size: 13px; }
+.dz-sub { margin: 6px 0 0; color: #666; font-size: 12px; }
+.dz-picked { margin: 8px 0 0; font-size: 12px; color: #1f6f63; font-weight: 600; }
+button.pick { padding: 3px 9px; background: #fff; font-weight: 600; font-size: 12px; margin: 0 1px; }
+button.pick:hover { background: #ececec; }
+textarea[readonly] { background: #fafafa; color: #444; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.fields-head { margin: 12px 0 0; font-weight: 700; }
+input.missing { border-color: #d9534f; background: #fff7f6; }
+button { padding: 6px 12px; border: 1px solid #c8c8c8; border-radius: 6px; background: #f6f6f6; cursor: pointer; }
+button:hover { background: #ececec; }
+button.primary { width: 100%; margin-top: 12px; padding: 9px; background: #41c9b4; border-color: #35b3a0; color: #fff; font-weight: 700; }
+button.primary:hover { background: #35b3a0; }
+button:disabled { opacity: .6; cursor: default; }
+.hint { color: #666; font-size: 12px; margin: 6px 0 0; }
+.status { margin: 8px 0 0; padding: 8px 10px; border-radius: 6px; background: #eef7f5; white-space: pre-line; }
+.status.error { background: #fdecea; color: #a12622; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: #555; }

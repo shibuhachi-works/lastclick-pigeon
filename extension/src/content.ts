@@ -1,0 +1,681 @@
+// note.com のタブで動く content script。
+// chrome.storage に pending の記事があれば、エディタに入力して公開ボタンの手前で止まる。
+// ログイン状態はこのタブのものをそのまま使う(拡張は Cookie に触らない)。
+import { normalizeLabel } from "../../shared/forbidden-click";
+import { matchesAnyText } from "../../shared/text-match";
+import { buildDiagnosticReport, describe, rect } from "./lib/diagnose";
+import { findEyecatchButton } from "../../shared/eyecatch-button";
+import { findMagazineRowButton } from "../../shared/magazine-row";
+import { articleKey, isSameArticle, lockArticleKey, type ArticleKeyRef } from "../../shared/article-key";
+import { safeClick, safeKey, safePress } from "./lib/safe-click";
+import { htmlToText } from "../../shared/markdown-safe";
+import { installFilePickerGuard, type FilePickerGuard } from "../../shared/file-picker-guard";
+import {
+  STORAGE,
+  type ArticlePayload,
+  type DiagnoseResponse,
+  type Message,
+  type Selectors,
+  type SelectorsResponse,
+  type WhoAmIResponse,
+} from "./lib/types";
+
+const PENDING_TTL_MS = 10 * 60 * 1000;
+/** ポップアップがタブを開いてから tabId を埋めるまでの猶予 */
+const TAB_ID_WAIT_MS = 3_000;
+
+// ポップアップからの診断要求。pending の有無に関係なく、note のどのページでも応える
+chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse: (r: DiagnoseResponse) => void) => {
+  if (msg?.type !== "diagnose") return;
+  requestSelectors()
+    .then(({ selectors }) => sendResponse({ ok: true, report: buildDiagnosticReport(selectors) }))
+    .catch((e) => sendResponse({ ok: false, error: (e as Error).message }));
+  return true; // 非同期で sendResponse する
+});
+
+main().catch((e) => banner(`エラー: ${(e as Error).message}`, "error"));
+
+async function main() {
+  const article = await getPendingForThisTab();
+  if (!article) return;
+
+  const { selectors: S, source } = await requestSelectors();
+
+  if (new RegExp(S.loginUrlPattern).test(location.href)) {
+    banner("note にログインしていません。ログインしてから、もう一度ポップアップから実行してください。", "error");
+    return;
+  }
+
+  // エディタ以外のページ(トップ等)で動いてしまわないよう、タイトル欄が出るまで待つ。出なければ何もしない
+  const titleEl = await waitFor(S.title, 15_000).catch(() => null);
+  if (!titleEl) return;
+
+  // 二重実行防止:ここで pending を消す(失敗しても再実行はポップアップから)
+  await chrome.storage.local.remove(STORAGE.pendingArticle);
+
+  banner(`入力中... (selectors: ${source})`);
+  const results: string[] = [];
+  // どの記事で始めたか。バナーのボタンを押したときに別の記事が開いていれば入れない。
+  // 新規作成から始めたときは、保存で id が付いた時点でその id に固定する(別の記事に移ったあとで "new" が何にでも一致しないように)
+  const keyRef: ArticleKeyRef = { key: articleKey(location.pathname) };
+  watchArticleKey(keyRef);
+
+  await step("タイトル", results, () => fillTitle(titleEl, article));
+  await step("本文", results, () => pasteBody(S, article));
+  const goOn = await step("見出し画像", results, () => setThumbnail(S, article));
+  const proceed = { label: "公開設定を入れる", onClick: () => runPublishSettings(S, article, results, keyRef) };
+  if (!goOn) {
+    // 見出し画像のアップロードを確認できないまま公開設定へ移ると、アップロードが途中で切れる可能性があるので、ここで止める
+    banner(
+      `⚠️ 見出し画像を確認できませんでした。画面で確かめてから「公開設定を入れる」を押してください。\n\n公開設定には進んでいません。\n${results.join("\n")}`,
+      "warn",
+      [proceed],
+    );
+    return;
+  }
+  if (!article.skipBodyReview) {
+    // 本文を確認してから公開設定へ。公開設定を「キャンセル」で閉じるとハッシュタグとマガジンが note 側で消えるので、
+    // 本文の確認・下書き保存・プレビューを先に済ませてもらう
+    // 途中の工程(タイトル・本文など)が失敗していても step() は先へ進むので、ここで ✗ を見て文言と色を変える
+    const failed = results.some((r) => r.includes("✗"));
+    banner(
+      (failed
+        ? `⚠️ 一部は入力できませんでした。画面で確かめ、足りないものは手で入れてから「公開設定を入れる」を押してください。\n\n`
+        : `✅ タイトル・本文・見出し画像を入れました。本文を確かめて、よければ「公開設定を入れる」を押してください。\n\n`) +
+        `下書き保存・プレビューはこの画面で済ませてください。\n「公開設定を入れる」を押すと、拡張が「公開に進む」を押し、ハッシュタグとマガジンを入れて止まります。\n${results.join("\n")}`,
+      failed ? "warn" : "ok",
+      [proceed],
+    );
+    return;
+  }
+  await runPublishSettings(S, article, results, keyRef);
+}
+
+/**
+ * 新規作成から始めたときに、保存で記事の id が付くのを見張って印を固定する(note は保存時に URL を /notes/<id>/edit に変える)。
+ * 固定できたら見張りをやめる
+ */
+function watchArticleKey(ref: ArticleKeyRef): void {
+  if (ref.key !== "new") return;
+  const timer = setInterval(() => {
+    lockArticleKey(ref, articleKey(location.pathname));
+    if (ref.key !== "new") clearInterval(timer);
+  }, 500);
+}
+
+/**
+ * 「公開に進む」を押してハッシュタグとマガジンを入れ、「投稿する」の手前で止まる。
+ * バナーの「公開設定を入れる」「もう一度入れる」からも呼ぶ(公開設定を「キャンセル」で閉じると note 側で消えるため)。
+ * 先に済んだ工程の結果(before)はそのまま残し、公開設定の結果だけを付け直す
+ */
+async function runPublishSettings(S: Selectors, article: ArticlePayload, before: string[], keyRef: ArticleKeyRef) {
+  // 始めたときと別の記事が開いていたら入れない(別の記事の公開設定を書き換えないため)。元の記事に戻れば同じボタンで続けられる
+  const now = articleKey(location.pathname);
+  lockArticleKey(keyRef, now);
+  if (!isSameArticle(keyRef.key, now)) {
+    banner(
+      `⚠️ 入力を始めたときと別の記事が開いているので、公開設定は入れませんでした。\n元の記事に戻ってから、もう一度押してください。\n\n${before.join("\n")}`,
+      "warn",
+      [{ label: "もう一度入れる", onClick: () => runPublishSettings(S, article, before, keyRef) }],
+    );
+    return;
+  }
+  banner("公開設定を入力中...");
+  const results = [...before];
+  // ハッシュタグとマガジンは別の工程にする。マガジンが見つからなくても、ハッシュタグが入ったことは分かるように
+  const opened = await step("公開設定", results, () => fillPublishSettings(S, article));
+  const magazine = article.magazine;
+  if (opened && magazine) await step("マガジン", results, () => selectMagazine(S, magazine));
+  // 失敗した工程は、たたんだままでも読めるように見出しに出す(「詳細」の中だけだと気づけない)。
+  // 工程名は外し、失敗の文言(複数行のこともある)をそのまま ⚠️ 付きで並べる
+  const failed = results.filter((r) => r.includes(" ✗ ")).map((r) => r.slice(r.indexOf(" ✗ ") + 3));
+  banner(
+    (failed.length
+      ? `${failed.map((m) => `⚠️ ${m}`).join("\n")}\n\n入ったものは画面で確かめ、足りないものは手で入れてから、「投稿する」を自分で押してください。\n`
+      : `✅ 入力が終わりました。内容を確認して、「投稿する」を自分で押してください。\n\n`) +
+      `「キャンセル」で戻ると、ハッシュタグとマガジンは note 側で消えます。\n直したあとは「もう一度入れる」を押してください。\n${results.join("\n")}`,
+    failed.length ? "warn" : "ok",
+    [{ label: "もう一度入れる", onClick: () => runPublishSettings(S, article, before, keyRef) }],
+  );
+}
+
+/**
+ * selectors は service worker に読んでもらう。content script は note.com の origin で動くので、
+ * 同梱の selectors.json(chrome-extension://)も GitHub も自分では fetch できない("Failed to fetch" になる)
+ */
+async function requestSelectors(): Promise<Extract<SelectorsResponse, { ok: true }>> {
+  const res = (await chrome.runtime.sendMessage({ type: "selectors" } satisfies Message).catch(() => null)) as SelectorsResponse | null;
+  if (!res) throw new Error("拡張の service worker から応答がありません。chrome://extensions で拡張を再読み込みしてください。");
+  if (!res.ok) throw new Error(`selectors を読めませんでした: ${res.error}`);
+  return res;
+}
+
+/**
+ * pending の記事が、このタブ(ポップアップが開いたタブ)向けのときだけ返す。
+ * 別のタブ(既存の記事の編集など)では何もしない。
+ */
+async function getPendingForThisTab(): Promise<ArticlePayload | null> {
+  const read = async () =>
+    ((await chrome.storage.local.get(STORAGE.pendingArticle)) as { pendingArticle?: ArticlePayload })[STORAGE.pendingArticle] ?? null;
+
+  let article = await read();
+  if (!article) return null;
+  if (Date.now() - article.createdAt > PENDING_TTL_MS) {
+    await chrome.storage.local.remove(STORAGE.pendingArticle);
+    return null;
+  }
+
+  // ポップアップがまだ tabId を埋めていなければ少し待つ。
+  // 最初の読み取りとリスナー登録の間に書き込みが入ると取りこぼすので、リスナーを登録してから読み直す
+  if (article.tabId === null) {
+    article = await new Promise<ArticlePayload | null>((resolve) => {
+      const done = (value: ArticlePayload | null) => {
+        clearTimeout(timer);
+        chrome.storage.onChanged.removeListener(onChange);
+        resolve(value);
+      };
+      const timer = setTimeout(() => done(null), TAB_ID_WAIT_MS);
+      function onChange(changes: Record<string, chrome.storage.StorageChange>, area: string) {
+        const next = area === "local" ? (changes[STORAGE.pendingArticle]?.newValue as ArticlePayload | undefined) : undefined;
+        if (next && next.tabId !== null) done(next);
+      }
+      chrome.storage.onChanged.addListener(onChange);
+      void read().then((again) => {
+        if (again && again.tabId !== null) done(again);
+      });
+    });
+    if (!article) return null;
+  }
+
+  const me = (await chrome.runtime.sendMessage({ type: "whoami" } satisfies Message).catch(() => null)) as WhoAmIResponse | null;
+  if (!me || me.tabId === null || me.tabId !== article.tabId) return null;
+  return article;
+}
+
+// ---------------------------------------------------------------------------
+// 各工程
+
+function fillTitle(el: HTMLElement, a: ArticlePayload) {
+  el.focus();
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+    setNativeValue(el, a.title);
+  } else {
+    // contenteditable
+    document.execCommand("selectAll", false);
+    document.execCommand("insertText", false, a.title);
+  }
+}
+
+/** md→HTML を、クリップボードから貼り付けたのと同じ経路でエディタに渡す */
+async function pasteBody(S: Selectors, a: ArticlePayload) {
+  const el = await waitFor(S.body, 10_000);
+  el.focus();
+  const dt = new DataTransfer();
+  dt.setData("text/html", a.html);
+  dt.setData("text/plain", htmlToText(a.html)); // innerHTML は使わない
+  el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+  await sleep(500);
+}
+
+async function setThumbnail(S: Selectors, a: ArticlePayload) {
+  if (!a.thumbnail) return "なし";
+  const file = base64ToFile(a.thumbnail);
+
+  // note がファイル選択ダイアログ(Finder など)を開こうとしたら止めて、その input に画像を渡す。
+  // 拡張のクリックは合成イベントなのでふつうは開かないが、人が直前にタブを触っているとブラウザが開いてしまう
+  const guard = installFilePickerGuard();
+  try {
+    return await setThumbnailGuarded(S, file, guard);
+  } finally {
+    guard.stop();
+  }
+}
+
+async function setThumbnailGuarded(S: Selectors, file: File, guard: FilePickerGuard) {
+  // (1) file input が DOM にあれば直接セット(hidden でも可)
+  let input = document.querySelector<HTMLInputElement>(S.thumbnail.fileInput);
+  if (!input) {
+    // (2) 見出し画像のボタンを押すとメニューと一緒に file input が出てくる(実機: #note-editor-eyecatch-input は
+    //     メニューを開いたときだけ DOM にある)。ボタンは selectors の指定 → 文字 → タイトル欄の上のアイコンボタンの順で探す
+    const title = document.querySelector<HTMLElement>(S.title);
+    const btn =
+      document.querySelector<HTMLElement>(S.thumbnail.addButton) ??
+      findByText("button", S.thumbnail.addButtonText) ??
+      (title ? findEyecatchButton(title) : null);
+    if (!btn) throw new Error("見出し画像のボタンが見つかりません。手動で設定してください(「DOM 情報を取得」の結果を送ってもらえれば直せます)。");
+    input = await activateEyecatchButton(S, btn, guard);
+  }
+
+  // 確定ボタン(「保存」)は、画像を入れたあとに新しく現れたものだけを押す。
+  // 画面にもとからある「保存」(例: 下書き保存)は完全一致でも押さないよう、入れる前の一覧を控えておく
+  const confirmBefore = new Set(findAllByText("button", S.thumbnail.confirmText));
+
+  const imagesBefore = new Set(Array.from(document.querySelectorAll("img, canvas")));
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+
+  // トリミング確認が出たら、その中(ダイアログ内、または新しく現れた)の確定ボタンだけを押す
+  const confirm = await waitForConfirm(S.thumbnail.confirmText, confirmBefore, 20_000);
+  if (!confirm) throw new StopError("画像は渡しました。トリミングの「保存」が見つからないので、出ていれば自分で押してください");
+
+  // 「保存」が現れた直後は画像がまだ読み込まれていないことがある(実機: ✓ なのに記事に画像が付かなかった)。
+  // 渡した画像がダイアログ(無ければページ)に表示されるまで待ってから押す。表示されなければ押さない
+  // 回線やサーバーの調子で時間が変わるので、待ち時間は長めに取る
+  const dialog = confirm.closest<HTMLElement>('dialog, [role="dialog"], [aria-modal="true"]');
+  const freshImage = (root: ParentNode) =>
+    Array.from(root.querySelectorAll<HTMLImageElement | HTMLCanvasElement>("img, canvas"))
+      .filter((el) => !imagesBefore.has(el))
+      .find((el) => (el instanceof HTMLImageElement ? el.complete && el.naturalWidth > 0 : canvasHasContent(el))) ?? null;
+  const loaded = await waitUntil(() => freshImage(dialog ?? document), 30_000);
+  if (!loaded) {
+    // トリミング画面が開いたままの可能性があるので、後続(公開設定への移動)には進まない
+    throw new StopError("画像は渡しましたが、トリミング画面に画像が表示されないので「保存」は押していません。表示されていれば自分で押してください");
+  }
+  await sleep(1_000); // 描画が落ち着くまで
+  const label = (confirm.textContent ?? "").trim();
+  const cr = confirm.getBoundingClientRect();
+  safePress(confirm, "setThumbnail.confirm", { x: cr.left + cr.width / 2, y: cr.top + cr.height / 2 }).release({ click: true });
+
+  // 「保存」のあとはアップロードが走る。トリミング画面が閉じて、記事側に見出し画像が表示されるまで待ってから次へ進む
+  // (すぐ公開設定へ移るとアップロードが途中で切れる可能性がある)
+  const shown = await waitUntil(() => {
+    const dialogOpen = dialog ? dialog.isConnected : Boolean(findDialog());
+    if (dialogOpen) return null;
+    return freshImage(document);
+  }, 60_000);
+  if (!shown) {
+    throw new StopError(
+      `トリミングの「${label}」は押しましたが、記事側に見出し画像が表示されるのを確認できませんでした(アップロードが遅いか失敗した可能性)`,
+    );
+  }
+  await sleep(1_500); // 保存処理が落ち着くまで
+  return `トリミングの「${label}」を押し、見出し画像が表示されました`;
+}
+
+/**
+ * 見出し画像のボタンを押してメニューを開き、画像の file input を返す。
+ * 実機(test11)では正しいボタンに pointerdown → click を送ってもメニューが開かなかったので、実際の操作に近い順で試す:
+ * (1) ボタンの中心にある要素(重なっている要素があればそれ)に hover → pointerdown → mousedown、(2) 続けて click、
+ * (3) Enter キー、(4) Space キー。それぞれの後で「入力欄」か「メニューの『画像をアップロード』」が出たかを見る。
+ * メニューが出たら「画像をアップロード」を押す(入力欄はこのときに作られる可能性がある。ファイル選択ダイアログは
+ * ユーザー操作なしでは開かないので、出た入力欄にファイルを直接入れる)。
+ * 出なければ、どこまで試して何が起きたかをエラー文に出す(バナーのスクリーンショットだけで次の手を決めるため)
+ */
+async function activateEyecatchButton(S: Selectors, btn: HTMLElement, guard: FilePickerGuard): Promise<HTMLInputElement> {
+  // ダイアログを止めたときの input(note がまさに使おうとしたもの)を優先し、無ければセレクタで探す
+  const fileInput = () => guard.input() ?? document.querySelector<HTMLInputElement>(S.thumbnail.fileInput);
+  const menuItem = () => findSmallestByText(S.thumbnail.uploadMenuText, S.body);
+  const appeared = (ms: number) => waitUntil(() => fileInput() ?? menuItem(), ms);
+  const log: string[] = [];
+
+  const r = btn.getBoundingClientRect();
+  const at = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  // 中心にあるのが SVG(click() が無い)などなら、ボタン自身に送る(子からのイベントと同じくボタンのハンドラに届く)
+  const atPoint = document.elementFromPoint(at.x, at.y);
+  const target = atPoint instanceof HTMLElement && (btn.contains(atPoint) || atPoint.contains(btn)) ? atPoint : btn;
+  if (atPoint && atPoint !== btn) log.push(`中心の要素: ${describe(atPoint as HTMLElement)}${target === btn ? "(ボタンの外なので、ボタン自身に送る)" : ""}`);
+
+  // 押している間に DOM へ新しく現れた要素を記録する(メニューが開いたのに見つけられていないのか、開いていないのかを切り分ける)
+  const added: HTMLElement[] = [];
+  const observer = new MutationObserver((records) => {
+    for (const rec of records) {
+      for (const node of Array.from(rec.addedNodes)) {
+        if (node instanceof HTMLElement && node.id !== "lastclick-pigeon-banner") added.push(node);
+      }
+    }
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  btn.focus();
+  log.push(`focus→${document.activeElement === btn ? "ボタン" : describe((document.activeElement as HTMLElement | null) ?? document.body)}`);
+  const press = safePress(target, "setThumbnail.addButton", at);
+  let hit = await appeared(500);
+  log.push(`pointer→${hit ? "出た" : "なし"}`);
+  press.release({ click: !hit });
+  if (!hit) {
+    hit = await appeared(1_000);
+    log.push(`click→${hit ? "出た" : "なし"}`);
+  }
+  for (const key of ["Enter", " "] as const) {
+    if (hit) break;
+    safeKey(btn, "setThumbnail.addButton", key);
+    hit = await appeared(1_000);
+    log.push(`${key === " " ? "Space" : key}→${hit ? "出た" : "なし"}`);
+  }
+  observer.disconnect();
+  if (guard.input()) log.push("ファイル選択ダイアログを止めた");
+  const shown = added.filter((el) => el.isConnected).slice(0, 12);
+  log.push(shown.length ? `現れた要素(${added.length} 件): ${shown.map((el) => describeShort(el)).join(" | ")}` : "現れた要素: なし");
+
+  let input = fileInput();
+  if (!input) {
+    const item = menuItem();
+    if (item) {
+      // 見出し画像のボタンと同じく、実際の操作と同じ順(hover → pointerdown → … → click)で押す
+      const ir = item.getBoundingClientRect();
+      safePress(item, "setThumbnail.uploadMenu", { x: ir.left + ir.width / 2, y: ir.top + ir.height / 2 }).release({ click: true });
+      log.push(`メニュー「${S.thumbnail.uploadMenuText[0]}」を押した`);
+      input = await waitUntil(fileInput, 5_000);
+    } else {
+      log.push(`メニュー「${S.thumbnail.uploadMenuText[0]}」なし`);
+    }
+  }
+  if (!input) {
+    throw new Error(
+      `見出し画像のボタンを押しましたが、画像の入力欄が出ませんでした。手動で設定してください。` +
+        `経過: ${log.join(" / ")}。押したボタン: ${rect(btn)} ${describe(btn)}`,
+    );
+  }
+  return input;
+}
+
+/** 確定ボタン: 開いているダイアログの中、または `before` に無かった新しいボタンが現れるまで待つ */
+function waitForConfirm(texts: string[], before: Set<HTMLElement>, timeout: number): Promise<HTMLElement | null> {
+  const find = () => {
+    const dialog = findDialog();
+    const inDialog = dialog ? findByText("button", texts, dialog) : null;
+    if (inDialog) return inDialog;
+    return findAllByText("button", texts).find((b) => !before.has(b)) ?? null;
+  };
+  return new Promise((resolve) => {
+    const found = find();
+    if (found) return resolve(found);
+    const obs = new MutationObserver(() => {
+      const el = find();
+      if (el) {
+        obs.disconnect();
+        clearTimeout(timer);
+        resolve(el);
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    const timer = setTimeout(() => {
+      obs.disconnect();
+      resolve(null);
+    }, timeout);
+  });
+}
+
+async function fillPublishSettings(S: Selectors, a: ArticlePayload) {
+  // 公開設定がまだ開いていなければ「公開に進む」を押す(「もう一度入れる」を公開設定の画面で押した場合は開いている)
+  if (!document.querySelector(S.publishSettings.hashtagInput)) {
+    const open = findByText("button", S.openPublishSettingsText);
+    if (!open) throw new Error("「公開に進む」ボタンが見つかりません。");
+    safeClick(open, "fillPublishSettings.open");
+  }
+
+  const tagInput = await waitFor<HTMLInputElement>(S.publishSettings.hashtagInput, 10_000);
+  for (const tag of a.hashtags) {
+    tagInput.focus();
+    setNativeValue(tagInput, tag);
+    tagInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    tagInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+    await sleep(200);
+  }
+
+  // 公開ボタンは「あるかどうか」を見るだけ。絶対にクリックしない。
+  if (!findByText("button", S.publishSettings.publishButtonText)) throw new Error("公開ボタンが見つかりません(画面構成が変わった可能性)。");
+}
+
+/** 公開設定の画面でマガジンを選ぶ。名前が一致する行が無ければ、直し方を添えて失敗にする */
+async function selectMagazine(S: Selectors, magazine: string) {
+  // 「マガジン」の切り替えは、まだオンでないときだけ押す(実機では最初からオン。押すとオフになって一覧が消える)
+  const toggle = findByText("button", S.publishSettings.magazineToggleText);
+  if (toggle && !isToggledOn(toggle)) {
+    safeClick(toggle, "fillPublishSettings.magazineToggle");
+    await sleep(300);
+  }
+  // (1) label / option 形式(名前そのものを押す)
+  const item = Array.from(document.querySelectorAll<HTMLElement>(S.publishSettings.magazineItem)).find(
+    (el) => el.textContent?.trim() === magazine,
+  );
+  if (item) {
+    // 「もう一度入れる」で再実行したときに、選択済みのものを押して外さない
+    if (!isSelected(item)) safeClick(item, "fillPublishSettings.magazineItem");
+    return;
+  }
+  // (2) 実機の形式: マガジン名の行に「追加」ボタンがある。名前の行の中だけを見る(別の行の「追加」は押さない)
+  const row = findMagazineRowButton(magazine, S.publishSettings.magazineAddButtonText);
+  if (!row.rowFound) {
+    throw new Error(
+      `マガジン「${magazine}」が note にありません。\nmd の magazine と note のマガジン名が同じか確かめてください。\n(画面で手で選ぶか、md を直して作り直してください)`,
+    );
+  }
+  if (row.button) {
+    if (!isToggledOn(row.button)) safeClick(row.button, "fillPublishSettings.magazineAdd");
+    return;
+  }
+  return `「追加」が無いので押していません(追加済みの可能性)`;
+}
+
+// ---------------------------------------------------------------------------
+// ユーティリティ
+
+/** 工程を途中で止めるべきときに投げる(後続の工程に進まない)。普通のエラーは記録して次へ進む */
+class StopError extends Error {}
+
+/** 工程を 1 つ実行して結果を記録する。後続に進んでよければ true、StopError なら false */
+async function step(name: string, results: string[], fn: () => Promise<unknown> | unknown): Promise<boolean> {
+  try {
+    const r = await fn();
+    results.push(`${name} ✓${typeof r === "string" ? `(${r})` : ""}`);
+    return true;
+  } catch (e) {
+    results.push(`${name} ✗ ${(e as Error).message}`);
+    console.warn(`[lastclick-pigeon] ${name}:`, e);
+    return !(e instanceof StopError);
+  }
+}
+
+function waitFor<T extends HTMLElement = HTMLElement>(selector: string, timeout: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const found = document.querySelector<T>(selector);
+    if (found) return resolve(found);
+    const obs = new MutationObserver(() => {
+      const el = document.querySelector<T>(selector);
+      if (el) {
+        obs.disconnect();
+        clearTimeout(timer);
+        resolve(el);
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    const timer = setTimeout(() => {
+      obs.disconnect();
+      reject(new Error(`要素が見つかりません: ${selector}`));
+    }, timeout);
+  });
+}
+
+/**
+ * 文言でボタン等を探す(class 名より文言のほうが変わりにくい)。
+ * 部分一致ではなく、正規化後の完全一致(textContent か aria-label)。`scope` を渡すとその中だけを探す
+ */
+/** 文字が候補のどれかに完全一致するボタン等をすべて返す */
+function findAllByText(tag: string, texts: string[], scope: ParentNode = document): HTMLElement[] {
+  return Array.from(scope.querySelectorAll<HTMLElement>(tag)).filter((el) =>
+    matchesAnyText([el.textContent, el.getAttribute("aria-label")], texts),
+  );
+}
+
+/**
+ * 文字が候補に(正規化後)完全一致する最小の要素を探し、その押せる祖先(button / menuitem / option / a / li)を返す。
+ * メニュー項目のように「文字 + 補足」で組まれていて、ボタン全体の文字では一致しないものを押すため。
+ * excludeSelector(記事本文など)と contenteditable の中は対象にしない
+ */
+function findSmallestByText(texts: string[], excludeSelector: string): HTMLElement | null {
+  // 実機のメニュー項目は「画像をアップロード」の文字と「推奨サイズ: …」が同じ要素に直接入っていて、
+  // 文字が完全一致する要素が無い(test13 で確認)。そこで「文字を含む最小の要素」にする
+  const norm = texts.map(normalizeLabel).filter((t) => t !== "");
+  const contains = (el: Element) => {
+    const t = normalizeLabel(el.textContent ?? "");
+    return norm.some((n) => t.includes(n));
+  };
+  for (const el of Array.from(document.querySelectorAll<HTMLElement>("body *"))) {
+    if (!contains(el)) continue;
+    if (el.closest(`[contenteditable="true"], textarea, ${excludeSelector}`)) continue; // 記事本文に同じ文字があっても押さない
+    if (Array.from(el.children).some(contains)) continue; // より小さい子がある
+    return el.closest<HTMLElement>('button, [role="menuitem"], [role="option"], a, li') ?? el;
+  }
+  return null;
+}
+
+/**
+ * canvas に何か描かれているか。幅があるだけでは証拠にならない(未指定でも既定値 300)ので、
+ * 画素を間引いて読み、透明でなく単色でもなければ描画済みとみなす。読めなければ(汚染など)false
+ */
+function canvasHasContent(c: HTMLCanvasElement): boolean {
+  try {
+    const ctx = c.getContext("2d");
+    if (!ctx || c.width === 0 || c.height === 0) return false;
+    const seen = new Set<string>();
+    for (let y = 0; y < c.height; y += Math.max(1, Math.floor(c.height / 8))) {
+      for (let x = 0; x < c.width; x += Math.max(1, Math.floor(c.width / 8))) {
+        const [r, g, b, a] = ctx.getImageData(x, y, 1, 1).data;
+        if (a > 0) seen.add(`${r},${g},${b},${a}`);
+      }
+    }
+    return seen.size >= 2;
+  } catch {
+    return false;
+  }
+}
+
+/** 要素の短い説明(タグ・id・role・文字の先頭)。「現れた要素」の一覧用 */
+function describeShort(el: HTMLElement): string {
+  const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+  const role = el.getAttribute("role");
+  return `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${role ? `[role=${role}]` : ""}${text ? ` "${text.slice(0, 30)}${text.length > 30 ? "…" : ""}"` : ""}`;
+}
+
+/** fn が null 以外を返すまで 250 ms おきに試す(timeout で null) */
+async function waitUntil<T>(fn: () => T | null, timeout: number): Promise<T | null> {
+  const until = Date.now() + timeout;
+  for (;;) {
+    const r = fn();
+    if (r !== null) return r;
+    if (Date.now() >= until) return null;
+    await sleep(250);
+  }
+}
+
+function findByText(tag: string, texts: string[], scope: ParentNode = document): HTMLElement | null {
+  const all = Array.from(scope.querySelectorAll<HTMLElement>(tag));
+  for (const t of texts) {
+    const hit = all.find((el) => matchesAnyText([el.textContent, el.getAttribute("aria-label")], [t]));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** トグル / チェックボックス風のボタンがオンか(aria-checked / aria-pressed / data-active) */
+function isToggledOn(el: HTMLElement): boolean {
+  return ["aria-checked", "aria-pressed", "data-active"].some((attr) => el.getAttribute(attr) === "true");
+}
+
+/** label(中のチェックボックス)や option が選択済みか */
+function isSelected(el: HTMLElement): boolean {
+  if (isToggledOn(el) || el.getAttribute("aria-selected") === "true") return true;
+  if (el instanceof HTMLOptionElement) return el.selected;
+  const input = el instanceof HTMLInputElement ? el : el.querySelector<HTMLInputElement>("input[type=checkbox], input[type=radio]");
+  return Boolean(input?.checked);
+}
+
+/** 開いているダイアログ(モーダル)。無ければ null */
+function findDialog(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('dialog[open], [role="dialog"], [aria-modal="true"]');
+}
+
+/** React / Vue 管理下の input に値を入れて、フレームワーク側に変更を気づかせる */
+function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(el, value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function base64ToFile(t: NonNullable<ArticlePayload["thumbnail"]>): File {
+  const bin = atob(t.base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], t.name, { type: t.mimeType });
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+type BannerAction = { label: string; onClick: () => Promise<void> | void };
+
+/**
+ * 画面右下に進捗を出す。note の DOM を汚さないよう shadow DOM に閉じる。
+ * text の 1 行目だけを出し、2 行目以降は「詳細」を押したときに開く(本文の確認の邪魔にならないように)。
+ * 「たたむ」で小さなピルにし、押すと戻る。actions を渡すとボタンを出す(押すとボタンを無効にして onClick を呼ぶ。失敗はエラーのバナーにする)
+ */
+function banner(text: string, kind: "info" | "ok" | "warn" | "error" = "info", actions: BannerAction[] = []) {
+  let host = document.getElementById("lastclick-pigeon-banner");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "lastclick-pigeon-banner";
+    document.body.appendChild(host);
+    host.attachShadow({ mode: "open" });
+  }
+  const colors = { info: "#2d6cdf", ok: "#1f9d7a", warn: "#c27c0e", error: "#c0392b" };
+  // 空行(\n\n)より前が常に見える部分(複数行でもよい)、後ろが「詳細」で開く部分
+  const sep = text.indexOf("\n\n");
+  const summary = sep < 0 ? text : text.slice(0, sep);
+  const details = sep < 0 ? "" : text.slice(sep + 2).trim();
+  // 文字リンク風のボタン(キーボードでも操作できるように button にする)
+  const link = `border:0;padding:0;background:none;color:#fff;cursor:pointer;opacity:.85;font:13px system-ui,sans-serif;text-decoration:underline;text-underline-offset:3px`;
+  const buttons = actions
+    .map(
+      (a, i) =>
+        `<button type="button" data-action="${i}" style="padding:6px 12px;border:0;border-radius:6px;
+          background:#fff;color:${colors[kind]};font:600 13px system-ui,sans-serif;cursor:pointer">${escapeHtml(a.label)}</button>`,
+    )
+    .join("");
+  host.shadowRoot!.innerHTML = `
+    <div id="box" style="position:fixed;right:16px;bottom:16px;z-index:2147483647;max-width:440px;padding:12px 16px;
+      border-radius:10px;background:${colors[kind]};color:#fff;font:14px/1.6 system-ui,sans-serif;
+      box-shadow:0 4px 16px rgba(0,0,0,.25)">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px"><b>Lastclick Pigeon</b><button type="button" id="min" aria-label="バナーをたたむ" style="${link}">たたむ</button></div>
+      <div style="white-space:pre-wrap">${escapeHtml(summary ?? "")}</div>
+      ${details ? `<div id="det" hidden style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.3);font-size:13px;opacity:.95;white-space:pre-wrap">${escapeHtml(details)}</div>` : ""}
+      <div style="margin-top:10px;display:flex;align-items:center;justify-content:flex-end;gap:12px">${details ? `<button type="button" id="tog" aria-expanded="false" aria-controls="det" style="${link}">詳細</button>` : ""}${buttons}</div>
+    </div>
+    <button type="button" id="pill" hidden aria-label="Lastclick Pigeon のバナーを開く" style="position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:6px 12px;border:0;border-radius:999px;
+      background:${colors[kind]};color:#fff;font:600 12px system-ui,sans-serif;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.25)">Lastclick Pigeon ▴</button>`;
+  const root = host.shadowRoot!;
+  const box = root.getElementById("box")!;
+  const pill = root.getElementById("pill")!;
+  root.getElementById("min")!.onclick = () => {
+    box.hidden = true;
+    pill.hidden = false;
+    pill.focus();
+  };
+  pill.onclick = () => {
+    pill.hidden = true;
+    box.hidden = false;
+    root.getElementById("min")!.focus();
+  };
+  const tog = root.getElementById("tog");
+  const det = root.getElementById("det");
+  if (tog && det) {
+    tog.onclick = () => {
+      det.hidden = !det.hidden;
+      tog.textContent = det.hidden ? "詳細" : "詳細を閉じる";
+      tog.setAttribute("aria-expanded", String(!det.hidden));
+    };
+  }
+  root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((b) => {
+    b.onclick = () => {
+      root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((x) => (x.disabled = true));
+      Promise.resolve(actions[Number(b.dataset.action)]!.onClick()).catch((e) => banner(`エラー: ${(e as Error).message}`, "error"));
+    };
+  });
+}
+
+function escapeHtml(s: string) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+}

@@ -1,0 +1,111 @@
+// Markdown → HTML を安全側に寄せるための部品。拡張(ブラウザ)と Playwright 版(Node)で共通。
+//
+// - 記事に書かれた生の HTML(<img onerror=...> など)は通さず、文字として見せる
+// - リンク・画像の URL は http(s) / mailto だけ。javascript: や data: は落とす
+// - text/plain 用のテキスト化は DOM(innerHTML)を使わずに行う
+//
+// marked 自体はここでは import しない(各パッケージの marked を使う)。
+// 使い方: marked.use({ renderer: SAFE_RENDERER })
+
+import { HTML_ENTITIES } from "./html-entities.js";
+
+const SAFE_LINK_PROTOCOLS = ["http:", "https:", "mailto:"];
+const SAFE_IMAGE_PROTOCOLS = ["http:", "https:"];
+
+export function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/**
+ * URL をブラウザと同じ手順で整えてから検査し、通るなら整えた URL を返す。通らなければ null。
+ * ブラウザ(URL 標準)は先頭・末尾の制御文字と空白を落とし、途中のタブ・改行を取り除いてから
+ * scheme を読む。そのため "java\tscript:" はブラウザでは javascript: になる(Codex の指摘)。
+ * 相対 URL は許可(記事内の相対リンク)。絶対 URL は scheme を見る。
+ */
+export function sanitizeUrl(href: string, protocols: readonly string[]): string | null {
+  const s = href
+    .replace(/[\t\n\r]/g, "") // 途中のタブ・改行はブラウザが無視する
+    .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, ""); // 先頭・末尾の制御文字と空白
+  if (s === "") return null;
+  if (/[\u0000-\u001f\u007f]/.test(s)) return null; // それ以外の制御文字が残っていたら拒否
+  // "javascript:" "data:" などは、先頭に scheme があれば URL として解釈できる
+  const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+  if (!m) return /^[\s\\]*\/\//.test(s) ? null : s; // scheme なし。"//evil" も弾く
+  return protocols.includes(`${m[1].toLowerCase()}:`) ? s : null;
+}
+
+export function isSafeUrl(href: string, protocols: readonly string[]): boolean {
+  return sanitizeUrl(href, protocols) !== null;
+}
+
+type HtmlToken = { text: string };
+// marked 14 の tokenizer は link / image の `title` と image の `text`(alt)を HTML エスケープ済みで渡す。
+// `href` はエスケープされていない。ここで再エスケープすると "&amp;amp;" のように二重になる(Codex の指摘)。
+// `href` に書かれた文字参照("?a=1&amp;b=2" の &amp;)は、いったん文字に戻してから検査・エスケープする。
+// 戻せない名前(HTML5 だけの &colon; など)は & のままエスケープされ、ブラウザでも文字のまま。
+// "javascript&colon;" が javascript: に化けることはない(& は常に &amp; になる)。
+type LinkToken = { href: string; title?: string | null; tokens: unknown[] };
+type ImageToken = { href: string; title?: string | null; text: string };
+
+/**
+ * marked v13+ の token 形式の renderer。
+ * `this.parser` を使うので、必ず marked.use({ renderer: SAFE_RENDERER }) の形で渡す。
+ */
+export const SAFE_RENDERER = {
+  /** 生の HTML(ブロック・インライン)は文字として出す */
+  html(token: HtmlToken): string {
+    return escapeHtml(token.text);
+  },
+  link(this: { parser: { parseInline(tokens: unknown[]): string } }, token: LinkToken): string {
+    const text = this.parser.parseInline(token.tokens);
+    const href = sanitizeUrl(decodeEntities(token.href), SAFE_LINK_PROTOCOLS);
+    if (href === null) return text;
+    const title = token.title ? ` title="${token.title}"` : ""; // エスケープ済み
+    return `<a href="${escapeHtml(href)}"${title}>${text}</a>`;
+  },
+  image(token: ImageToken): string {
+    const href = sanitizeUrl(decodeEntities(token.href), SAFE_IMAGE_PROTOCOLS);
+    if (href === null) return token.text; // エスケープ済み
+    const title = token.title ? ` title="${token.title}"` : ""; // エスケープ済み
+    return `<img src="${escapeHtml(href)}" alt="${token.text}"${title}>`;
+  },
+};
+
+
+/** 文字参照を文字に戻す。数値(&#...; &#x...;)と HTML 4.01 の名前付き(html-entities.ts)。戻せないものはそのまま */
+export function decodeEntities(s: string): string {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-zA-Z][a-zA-Z0-9]*);/gi, (whole, code: string) => {
+    if (code[0] === "#") {
+      const n = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+      return Number.isFinite(n) && n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : whole;
+    }
+    return HTML_ENTITIES[code] ?? whole; // 名前は大文字小文字を区別する(&Agrave; と &agrave;)
+  });
+}
+
+/**
+ * HTML からタグを除いて、貼り付けの text/plain に使う文字にする。
+ * innerHTML を使わないので、どんな HTML でも読み込み・実行は起きない。
+ * <pre> の中(コードブロック)は空白・改行をそのまま残す。詰めるのは地の文の改行だけ(Codex の指摘)。
+ */
+export function htmlToText(html: string): string {
+  // <pre>...</pre> とそれ以外に分ける(split の捕捉グループで、奇数番目が <pre>)
+  const parts = html.replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, "").split(/(<pre\b[^>]*>[\s\S]*?<\/pre\s*>)/i);
+  const text = parts.map((part, i) => (i % 2 === 1 ? preToText(part) : proseToText(part))).join("");
+  return text.replace(/^\n+|\n+$/g, ""); // 前後の改行だけ落とす(コードの先頭の字下げは残す)
+}
+
+/** コードブロック: タグを除いて文字参照を戻すだけ。改行の圧縮や trim はしない */
+function preToText(pre: string): string {
+  return decodeEntities(pre.replace(/<[^>]+>/g, ""));
+}
+
+/** 地の文: ブロックの切れ目を改行にし、3 つ以上続く改行は 2 つに詰める */
+function proseToText(html: string): string {
+  return decodeEntities(
+    html
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|h[1-6]|li|blockquote|tr|section|article)\s*>/gi, "\n")
+      .replace(/<[^>]+>/g, ""),
+  ).replace(/\n{3,}/g, "\n\n");
+}

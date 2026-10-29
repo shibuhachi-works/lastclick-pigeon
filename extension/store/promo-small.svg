@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="280" viewBox="0 0 440 280"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#1f6f62"/><stop offset="1" stop-color="#2a9d8b"/></linearGradient></defs><rect width="440" height="280" rx="0" fill="url(#bg)"/><circle cx="63" cy="140" r="94" fill="#fff" opacity=".04"/>
+  <!-- 従来の1.03倍から約15%拡大。イラストは左1/3に収める。 -->
+  <g transform="translate(-2 70) scale(1.1845)">
+    <g id="pigeon"><path fill="#fff" d="M18 62 5 47 30 52C37 48 39 45 44 38L54 24C60 15 76 15 83 24 88 30 87 38 83 44L75 57C70 73 56 83 40 82 29 81 22 74 18 62Z"/><path fill="#d4eee8" d="M25 57C38 55 46 49 54 42 56 57 46 70 33 70Z"/><circle cx="75" cy="29" r="3.4" fill="#173e38"/><path fill="#e8b96a" d="m85 33 13 5-15 5Z"/></g>
+    <g id="note" transform="translate(94 37) rotate(5)">
+      <path d="M0 0h23l7 8v56H0Z" fill="#fff"/>
+      <path d="M23 0v8h7" fill="#c7e7df"/>
+      <path d="M5 19h20M10 32h15M10 45h13" fill="none" stroke="#2a9d8b" stroke-width="4"/>
+      <path d="M5 32h1M5 45h1" stroke="#2a9d8b" stroke-width="4"/>
+    </g>
+  </g>
+</svg>

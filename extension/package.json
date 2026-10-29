@@ -1,0 +1,24 @@
+{
+  "name": "lastclick-pigeon-extension",
+  "version": "0.1.1",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "icons": "node icons/render.mjs",
+    "package": "node package.mjs",
+    "screenshots": "node store/screenshots.mjs"
+  },
+  "dependencies": {
+    "marked": "^14.1.2",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

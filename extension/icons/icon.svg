@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#4fd3bd"/><stop offset="1" stop-color="#2a9d8b"/></linearGradient></defs><rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- 全サイズ共通の 1 原稿。鳩(大きく)+ くちばしの紙片。16px でも潰れないよう、カーソルは入れない。鳩のパスは promo/marquee の素材と同じ -->
+  <g id="pigeon" transform="translate(4 20) scale(.95)"><path fill="#fff" d="M18 62 5 47 30 52C37 48 39 45 44 38L54 24C60 15 76 15 83 24 88 30 87 38 83 44L75 57C70 73 56 83 40 82 29 81 22 74 18 62Z"/><path fill="#d4eee8" d="M25 57C38 55 46 49 54 42 56 57 46 70 33 70Z"/><circle cx="75" cy="29" r="4.2" fill="#173e38"/><path fill="#e8b96a" d="m85 33 14 5-16 6Z"/></g>
+  <g id="note" transform="translate(94 52) rotate(8) scale(.95)">
+    <path d="M0 0h23l7 7v29H0Z" fill="#fff"/>
+    <path d="M23 0v7h7" fill="#c7e7df"/>
+    <path d="M6 12h18M6 21h18M6 29h15" fill="none" stroke="#2a9d8b" stroke-width="3.5"/>
+  </g>
+</svg>

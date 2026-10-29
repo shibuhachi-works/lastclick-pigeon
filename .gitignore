@@ -1,0 +1,6 @@
+node_modules/
+# ログイン済み Chrome プロファイル(Cookie を含むので絶対にコミットしない)
+.profile/
+# preview の出力
+.preview/
+.env
