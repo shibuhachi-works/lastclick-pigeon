@@ -64,7 +64,12 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
     context = await chromium.launchPersistentContext(userDataDir, {
       ...(executablePath ? { executablePath } : { channel: "chromium" }),
       headless: true,
-      args: [`--disable-extensions-except=${DIST}`, `--load-extension=${DIST}`],
+      args: [
+        `--disable-extensions-except=${DIST}`,
+        `--load-extension=${DIST}`,
+        // 差し替えが間に合わなかったときの保険。note と GitHub の名前を手元に向け、本物には届かないようにする
+        "--host-resolver-rules=MAP note.com 127.0.0.1, MAP editor.note.com 127.0.0.1, MAP raw.githubusercontent.com 127.0.0.1",
+      ],
     });
     // note には出ていかない。エディタは模擬ページを返す
     await context.route(/^https:\/\/(editor\.)?note\.com\//, (route) =>
@@ -98,6 +103,24 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
 
   it("md ファイルを選んで「note の下書きを作成」を押すと、エディタにタイトルと本文が入って止まる", async () => {
     const popup = await context.newPage();
+    // 拡張が chrome.tabs.create で開いたタブの最初の読み込みは、Playwright の差し替え(route)より先に通ることがある
+    // (CI で本物の note.com に出ていった)。テストでは一度 about:blank で開き、差し替えが効いてから note の URL に移す
+    await popup.addInitScript(() => {
+      // ルートの tsconfig には chrome の型が無いので、使う分だけ書く
+      type Props = { url?: string; active?: boolean };
+      type Tabs = {
+        create: (p: Props) => Promise<{ id?: number }>;
+        update: (id: number, p: Props) => Promise<unknown>;
+      };
+      const tabs = (globalThis as unknown as { chrome: { tabs: Tabs } }).chrome.tabs;
+      const create = tabs.create.bind(tabs);
+      tabs.create = async (props) => {
+        const tab = await create({ ...props, url: "about:blank" });
+        await new Promise((r) => setTimeout(r, 1_000));
+        await tabs.update(tab.id!, { url: props.url });
+        return tab;
+      };
+    });
     const errors: string[] = [];
     popup.on("pageerror", (e) => errors.push(e.message));
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
