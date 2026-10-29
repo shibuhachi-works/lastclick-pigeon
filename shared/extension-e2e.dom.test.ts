@@ -12,6 +12,8 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { chromium, type BrowserContext, type Page } from "playwright";
+import { collectClickLabels } from "./click-labels.js";
+import { assertClickAllowed } from "./forbidden-click.js";
 
 const DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extension/dist");
 
@@ -40,14 +42,24 @@ hashtags: [テスト]
 - 箇条書き 2
 `;
 
+/** 拡張の safeClick と同じ手順(禁止文字の判定 → クリック)。テストのクリックもここを通す(AGENTS.md) */
+async function safeClickLike(page: Page, selector: string) {
+  const labels = await page.locator(selector).evaluate(collectClickLabels);
+  assertClickAllowed(labels, selector);
+  await page.locator(selector).click();
+}
+
 describe("拡張の起動と、ポップアップから下書きを作るまで(E2E)", () => {
   let context: BrowserContext;
   let userDataDir: string;
   let extensionId: string;
+  let selectorsFetches = 0;
 
   before(async () => {
     assert.ok(existsSync(path.join(DIST, "manifest.json")), "extension/dist がありません。先に extension で npm run build をしてください");
     userDataDir = mkdtempSync(path.join(tmpdir(), "pigeon-e2e-"));
+    // 拡張の service worker が出す通信(セレクタの取得)も context.route で止められるようにする
+    process.env.PW_EXPERIMENTAL_SERVICE_WORKER_NETWORK_EVENTS = "1";
     const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || undefined;
     context = await chromium.launchPersistentContext(userDataDir, {
       ...(executablePath ? { executablePath } : { channel: "chromium" }),
@@ -58,6 +70,12 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
     await context.route(/^https:\/\/(editor\.)?note\.com\//, (route) =>
       route.fulfill({ status: 200, contentType: "text/html; charset=utf-8", body: EDITOR }),
     );
+    // セレクタは GitHub から取らせず、拡張に同梱した値(このビルドに入ったもの)を使わせる。
+    // GitHub の main の状態に左右されず、同梱の値が壊れていれば気づける
+    await context.route(/^https:\/\/raw\.githubusercontent\.com\//, (route) => {
+      selectorsFetches++;
+      return route.abort();
+    });
     const worker = context.serviceWorkers()[0] ?? (await context.waitForEvent("serviceworker", { timeout: 15_000 }));
     extensionId = new URL(worker.url()).host;
   });
@@ -89,8 +107,7 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
 
     // 新しいタブは about:blank で作られてから note の URL に移るので、作られたあとで URL を待つ
     const editorPromise = context.waitForEvent("page", { timeout: 15_000 });
-    // 拡張のボタンなので、禁止文字の判定(「投稿する」「公開する」)に当たらないことは文言で明らか
-    await popup.locator("#submit").click();
+    await safeClickLike(popup, "#submit");
     const editor: Page = await editorPromise.catch(async (e) => {
       throw new Error(`note のタブが開きませんでした。ポップアップの表示: ${await popup.locator("#status").textContent()} (${(e as Error).message})`);
     });
@@ -114,6 +131,8 @@ describe("拡張の起動と、ポップアップから下書きを作るまで(
     assert.match(body, /<h2[^>]*>見出しです<\/h2>/);
     assert.match(body, /<strong>太字<\/strong>/);
     assert.match(body, /<li>箇条書き 1<\/li>/);
+    // GitHub への取得は止めたので、同梱のセレクタで最後まで通ったことになる
+    assert.ok(selectorsFetches >= 1, "セレクタの取得が遮断されていません(GitHub から取っている可能性)");
     assert.deepEqual(errors, []);
   });
 });
