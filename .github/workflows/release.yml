@@ -5,9 +5,11 @@ name: リリースを作る
 # コミットを指定して起動すると、この workflow がリリースを作る。タグはリリースと一緒に GitHub が作る。
 # 起動できるのはリポジトリに書き込める人だけ(workflow_dispatch の決まり)。
 #
-# タグを直接作らない理由: Actions の token は、.github/workflows/ を含む先へ新しい ref(タグ)を作れない。
-# git push は「workflows の権限がない」と拒まれ(2026-10-30 の 1 回目)、ref を作る API も 403 になる(同 2 回目)。
-# `workflows` の権限は Actions の token には付けられない。リリースの作成はこの確認を通らない。
+# タグについて: Actions の token は、main と比べて .github/workflows/ に差分があるコミットへ新しいタグを作れない
+# (git push は「workflows の権限がない」と拒まれ、ref を作る API も 403。リリースの作成でタグを作る場合も同じ。
+# `workflows` の権限は Actions の token には付けられない)。
+# - main の先頭のように workflow の差分が無いコミットなら、この workflow がタグも作る(--target)
+# - 古いコミット(workflow の差分がある)は、人が先にタグを打つ。タグが既にあれば、それを使ってリリースだけ作る
 #
 # リリースの本文は docs/releases/<タグ名>.md。無ければ止まる(文面は PR でレビューしてから置く)。
 on:
@@ -48,9 +50,6 @@ jobs:
           git merge-base --is-ancestor "$SHA" origin/main || { echo "main に入っていないコミットです: $SHA"; exit 1; }
           NOTES="docs/releases/$TAG.md"
           [[ -f "$NOTES" ]] || { echo "本文がありません: $NOTES(先に PR で置いてください)"; exit 1; }
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            echo "タグは既にあります: $TAG"; exit 1
-          fi
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "リリースは既にあります: $TAG"; exit 1
           fi
@@ -58,5 +57,14 @@ jobs:
           TITLE=$(sed -n '1s/^#\+ *//p' "$NOTES")
           [[ -n "$TITLE" ]] || { echo "本文の 1 行目は「# タイトル」にしてください: $NOTES"; exit 1; }
           tail -n +2 "$NOTES" > "$RUNNER_TEMP/notes.md"
-          gh release create "$TAG" --repo "$REPO" --target "$SHA" --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md"
-          echo "作ったリリース: $TAG → $SHA"
+          # タグが既にあれば、それが指すコミットを確かめて、そのタグでリリースを作る。無ければタグも一緒に作る
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            git fetch -q origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+            [[ "$TAG_SHA" == "$SHA" ]] || { echo "タグ $TAG は別のコミットを指しています: $TAG_SHA"; exit 1; }
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "既にあるタグでリリースを作りました: $TAG → $SHA"
+          else
+            gh release create "$TAG" --repo "$REPO" --target "$SHA" --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "タグとリリースを作りました: $TAG → $SHA"
+          fi
