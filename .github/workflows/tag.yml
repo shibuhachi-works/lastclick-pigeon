@@ -2,8 +2,10 @@ name: タグを打つ
 
 # 版のタグを GitHub Actions に打たせる(手で起動する)。
 # クラウドの作業環境(AI)からはタグの push もリリースの作成も止められるので、
-# コミットを指定して起動すると、この workflow が annotated tag を作って push する。
+# コミットを指定して起動すると、この workflow が annotated tag を作る。
 # 起動できるのはリポジトリに書き込める人だけ(workflow_dispatch の決まり)。
+# タグは git push ではなく GitHub の API で作る。Actions の token で新しい ref を git push すると、
+# その先に .github/workflows/ があるだけで「workflows の権限がない」と拒まれるため(2026-10-30 の初回の実行で確認)。
 on:
   workflow_dispatch:
     inputs:
@@ -34,12 +36,14 @@ jobs:
           fetch-depth: 0
       - name: 入力を確かめて、タグを打つ
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           SHA: ${{ inputs.sha }}
           MESSAGE: ${{ inputs.message }}
         run: |
           set -eu
-          # 形を確かめる(入力はそのまま git に渡さず、env 経由で使う)
+          # 形を確かめる(入力はそのまま git や API に渡さず、env 経由で使う)
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "タグ名は v1.2.3 の形にしてください: $TAG"; exit 1; }
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SHA は 40 文字の小文字の 16 進数にしてください: $SHA"; exit 1; }
           git cat-file -e "$SHA^{commit}" || { echo "コミットが見つかりません: $SHA"; exit 1; }
@@ -47,8 +51,10 @@ jobs:
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
             echo "タグは既にあります: $TAG"; exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" "$SHA" -m "${MESSAGE:-$TAG}"
-          git push origin "refs/tags/$TAG"
+          # annotated tag のオブジェクトを作り、それを指す ref を作る(どちらも API)
+          TAG_SHA=$(gh api "repos/$REPO/git/tags" \
+            -f tag="$TAG" -f object="$SHA" -f type=commit -f message="${MESSAGE:-$TAG}" \
+            -f 'tagger[name]=github-actions[bot]' -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+            --jq .sha)
+          gh api "repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$TAG_SHA" --jq .ref
           echo "打ったタグ: $TAG → $SHA"
