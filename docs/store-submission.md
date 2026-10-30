@@ -39,6 +39,7 @@ npm run package     # → extension/release/lastclick-pigeon-for-note-<version>.
 
 - 審査は通常 1〜3 日。ホスト権限が付いているので、権限の理由が薄いと差し戻される。差し戻しのメールが来たら、本文を Issue に貼れば AI が回答案と修正 PR を作る
 - 公開されたら、ストアの URL を AI に渡す。紹介ページ(portfolio リポジトリ)の `storeUrl` を入れる PR と、`docs/ROADMAP.md` の「Chrome ウェブストアに公開」にチェックを入れる PR を作る
+- 版のタグとリリースは、`docs/releases/<タグ名>.md` に本文を置く PR をマージしたあと、Actions の「リリースを作る」を起動して作る(タグ名と、ストアに上げた版のコミットの SHA を入れる)。AI の作業環境からはタグもリリースも直接は作れないので、この workflow を使う
 
 ## 5. 次に上げ直すとき
 
