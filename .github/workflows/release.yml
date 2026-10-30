@@ -1,0 +1,70 @@
+name: リリースを作る
+
+# 版のリリース(とタグ)を GitHub Actions に作らせる(手で起動する)。
+# クラウドの作業環境(AI)からはタグの push もリリースの作成も止められるので、
+# コミットを指定して起動すると、この workflow がリリースを作る。タグはリリースと一緒に GitHub が作る。
+# 起動できるのはリポジトリに書き込める人だけ(workflow_dispatch の決まり)。
+#
+# タグについて: Actions の token は、main と比べて .github/workflows/ に差分があるコミットへ新しいタグを作れない
+# (git push は「workflows の権限がない」と拒まれ、ref を作る API も 403。リリースの作成でタグを作る場合も同じ。
+# `workflows` の権限は Actions の token には付けられない)。
+# - main の先頭のように workflow の差分が無いコミットなら、この workflow がタグも作る(--target)
+# - 古いコミット(workflow の差分がある)は、人が先にタグを打つ。タグが既にあれば、それを使ってリリースだけ作る
+#
+# リリースの本文は docs/releases/<タグ名>.md。無ければ止まる(文面は PR でレビューしてから置く)。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "タグ名(例: v0.1.1)。docs/releases/<タグ名>.md が本文になる"
+        required: true
+        type: string
+      sha:
+        description: "リリースするコミット(40 文字の SHA。main に入っているものだけ)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: リリースを作る
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: 入力を確かめて、リリースを作る
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -eu
+          # 形を確かめる(入力はそのまま git や gh に渡さず、env 経由で使う)
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "タグ名は v1.2.3 の形にしてください: $TAG"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SHA は 40 文字の小文字の 16 進数にしてください: $SHA"; exit 1; }
+          git cat-file -e "$SHA^{commit}" || { echo "コミットが見つかりません: $SHA"; exit 1; }
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "main に入っていないコミットです: $SHA"; exit 1; }
+          NOTES="docs/releases/$TAG.md"
+          [[ -f "$NOTES" ]] || { echo "本文がありません: $NOTES(先に PR で置いてください)"; exit 1; }
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "リリースは既にあります: $TAG"; exit 1
+          fi
+          # 本文の 1 行目(# 見出し)をタイトルにし、残りを本文にする
+          TITLE=$(sed -n '1s/^#\+ *//p' "$NOTES")
+          [[ -n "$TITLE" ]] || { echo "本文の 1 行目は「# タイトル」にしてください: $NOTES"; exit 1; }
+          tail -n +2 "$NOTES" > "$RUNNER_TEMP/notes.md"
+          # タグが既にあれば、それが指すコミットを確かめて、そのタグでリリースを作る。無ければタグも一緒に作る
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            git fetch -q origin "refs/tags/$TAG:refs/tags/$TAG"
+            TAG_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+            [[ "$TAG_SHA" == "$SHA" ]] || { echo "タグ $TAG は別のコミットを指しています: $TAG_SHA"; exit 1; }
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "既にあるタグでリリースを作りました: $TAG → $SHA"
+          else
+            gh release create "$TAG" --repo "$REPO" --target "$SHA" --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md"
+            echo "タグとリリースを作りました: $TAG → $SHA"
+          fi
